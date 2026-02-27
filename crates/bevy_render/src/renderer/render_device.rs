@@ -10,10 +10,99 @@ use wgpu::{
     BindGroupLayoutEntry, BufferAsyncError, BufferBindingType, PollError, PollStatus,
 };
 
+#[cfg(target_arch = "wasm32")]
+use alloc::sync::Arc;
+#[cfg(target_arch = "wasm32")]
+use std::collections::HashMap;
+#[cfg(target_arch = "wasm32")]
+use std::sync::Mutex;
+
 /// This GPU device is responsible for the creation of most rendering and compute resources.
 #[derive(Resource, Clone)]
 pub struct RenderDevice {
     device: WgpuWrapper<wgpu::Device>,
+    #[cfg(target_arch = "wasm32")]
+    bind_group_cache: Arc<Mutex<BindGroupCache>>,
+}
+
+#[cfg(target_arch = "wasm32")]
+const BIND_GROUP_CACHE_MAX_ENTRIES: usize = 256;
+
+/// Two-generation bind group cache. Entries survive up to 2 "epochs"
+/// (each epoch ≈ one render frame). Entries not reused across epochs
+/// are dropped, releasing their references to GPU buffers/textures.
+/// A hard cap prevents unbounded growth even in pathological cases.
+#[cfg(target_arch = "wasm32")]
+struct BindGroupCache {
+    map: HashMap<u64, CachedBindGroup>,
+    epoch: u64,
+    access_count: u64,
+    epoch_start: u64,
+    accesses_first_epoch: u64,
+}
+
+#[cfg(target_arch = "wasm32")]
+struct CachedBindGroup {
+    bind_group: BindGroup,
+    epoch: u64,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl BindGroupCache {
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            epoch: 0,
+            access_count: 0,
+            epoch_start: 0,
+            accesses_first_epoch: 0,
+        }
+    }
+
+    fn get_or_insert(
+        &mut self,
+        key: u64,
+        create: impl FnOnce() -> BindGroup,
+    ) -> BindGroup {
+        self.access_count += 1;
+        self.maybe_advance_epoch();
+
+        if let Some(entry) = self.map.get_mut(&key) {
+            entry.epoch = self.epoch;
+            return entry.bind_group.clone();
+        }
+
+        let bind_group = create();
+        self.map.insert(key, CachedBindGroup {
+            bind_group: bind_group.clone(),
+            epoch: self.epoch,
+        });
+
+        // Hard cap: if we somehow exceed the limit, drop everything.
+        if self.map.len() > BIND_GROUP_CACHE_MAX_ENTRIES {
+            self.map.clear();
+        }
+
+        bind_group
+    }
+
+    fn maybe_advance_epoch(&mut self) {
+        let accesses_this_epoch = self.access_count - self.epoch_start;
+        // Calibrate epoch length from the first epoch (= one frame's worth).
+        // Use a minimum of 32 to avoid thrashing on tiny scenes.
+        let epoch_len = self.accesses_first_epoch.max(32);
+
+        if accesses_this_epoch >= epoch_len {
+            if self.epoch == 0 {
+                self.accesses_first_epoch = accesses_this_epoch;
+            }
+            self.epoch += 1;
+            self.epoch_start = self.access_count;
+            // Evict entries not used in the previous epoch.
+            let min_epoch = self.epoch.saturating_sub(1);
+            self.map.retain(|_, v| v.epoch >= min_epoch);
+        }
+    }
 }
 
 impl From<wgpu::Device> for RenderDevice {
@@ -24,7 +113,11 @@ impl From<wgpu::Device> for RenderDevice {
 
 impl RenderDevice {
     pub fn new(device: WgpuWrapper<wgpu::Device>) -> Self {
-        Self { device }
+        Self {
+            device,
+            #[cfg(target_arch = "wasm32")]
+            bind_group_cache: Arc::new(Mutex::new(BindGroupCache::new())),
+        }
     }
 
     /// List all [`Features`](wgpu::Features) that may be used with this device.
@@ -143,19 +236,41 @@ impl RenderDevice {
     }
 
     /// Creates a new [`BindGroup`](wgpu::BindGroup).
-    #[inline]
+    ///
+    /// On WASM targets, bind groups are cached by a hash of their layout and
+    /// entries to avoid recreating identical groups every frame. Without this
+    /// cache, the browser's garbage collector must periodically sweep thousands
+    /// of short-lived GPU object wrappers, causing visible frame stutters.
+    /// See <https://github.com/bevyengine/bevy/issues/22545>.
     pub fn create_bind_group<'a>(
         &self,
         label: impl Into<wgpu::Label<'a>>,
         layout: &'a BindGroupLayout,
         entries: &'a [BindGroupEntry<'a>],
     ) -> BindGroup {
-        let wgpu_bind_group = self.device.create_bind_group(&BindGroupDescriptor {
-            label: label.into(),
-            layout,
-            entries,
-        });
-        BindGroup::from(wgpu_bind_group)
+        #[cfg(target_arch = "wasm32")]
+        {
+            let key = compute_bind_group_hash(layout, entries);
+            let label = label.into();
+            let device = &self.device;
+            self.bind_group_cache.lock().unwrap().get_or_insert(key, || {
+                BindGroup::from(device.create_bind_group(&BindGroupDescriptor {
+                    label,
+                    layout,
+                    entries,
+                }))
+            })
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let wgpu_bind_group = self.device.create_bind_group(&BindGroupDescriptor {
+                label: label.into(),
+                layout,
+                entries,
+            });
+            BindGroup::from(wgpu_bind_group)
+        }
     }
 
     /// Creates a [`BindGroupLayout`](wgpu::BindGroupLayout).
@@ -289,6 +404,64 @@ impl RenderDevice {
             BufferBindingType::Storage { read_only: true }
         } else {
             BufferBindingType::Uniform
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn compute_bind_group_hash(layout: &BindGroupLayout, entries: &[BindGroupEntry]) -> u64 {
+    use core::hash::{Hash, Hasher};
+    use std::hash::DefaultHasher;
+
+    let mut hasher = DefaultHasher::new();
+    layout.id().hash(&mut hasher);
+    entries.len().hash(&mut hasher);
+    for entry in entries {
+        entry.binding.hash(&mut hasher);
+        hash_binding_resource(&entry.resource, &mut hasher);
+    }
+    hasher.finish()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn hash_binding_resource<H: core::hash::Hasher>(resource: &wgpu::BindingResource, hasher: &mut H) {
+    use core::hash::Hash;
+
+    core::mem::discriminant(resource).hash(hasher);
+    match resource {
+        wgpu::BindingResource::Buffer(binding) => {
+            binding.buffer.hash(hasher);
+            binding.offset.hash(hasher);
+            binding.size.map(|s| s.get()).hash(hasher);
+        }
+        wgpu::BindingResource::BufferArray(arr) => {
+            arr.len().hash(hasher);
+            for b in *arr {
+                b.buffer.hash(hasher);
+                b.offset.hash(hasher);
+                b.size.map(|s| s.get()).hash(hasher);
+            }
+        }
+        wgpu::BindingResource::Sampler(sampler) => {
+            (*sampler).hash(hasher);
+        }
+        wgpu::BindingResource::SamplerArray(arr) => {
+            arr.len().hash(hasher);
+            for s in *arr {
+                (*s).hash(hasher);
+            }
+        }
+        wgpu::BindingResource::TextureView(view) => {
+            (*view).hash(hasher);
+        }
+        wgpu::BindingResource::TextureViewArray(arr) => {
+            arr.len().hash(hasher);
+            for v in *arr {
+                (*v).hash(hasher);
+            }
+        }
+        _ => {
+            255u8.hash(hasher);
         }
     }
 }
